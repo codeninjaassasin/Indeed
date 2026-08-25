@@ -1,0 +1,20 @@
+# Secrets — never commit. .env holds the Mattermost webhook URL.
+.env
+
+# Local TLS material (internal CA export; regenerate per machine — see README)
+certs/
+
+# Runtime state written by the app
+seen_jobs.json
+safe_proxies.json
+config.json
+*.tmp
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Browser profiles, if any are recreated
+.chrome_profile/
+.indeed_profile/

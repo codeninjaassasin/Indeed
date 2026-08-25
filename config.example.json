@@ -1,0 +1,52 @@
+{
+  "roles": [
+    "Senior AI Engineer GenAI",
+    "Senior Full Stack Engineer"
+  ],
+  "region": "us_remote",
+  "easy_apply_only": true,
+  "job_types": [
+    "fulltime",
+    "parttime",
+    "contract"
+  ],
+  "title_include": [],
+  "title_exclude": [
+    "manager",
+    "director",
+    "vp",
+    "vice president",
+    "head of",
+    "chief",
+    "product owner",
+    "scrum master",
+    "agile coach",
+    "consultant",
+    "analyst",
+    "quality assurance",
+    "qa",
+    "support engineer",
+    "product builder",
+    "sales",
+    "account executive",
+    "recruiter",
+    "instructor",
+    "teacher",
+    "intern",
+    "internship",
+    "solutions architect",
+    "services architect",
+    "enterprise architect",
+    "salesforce",
+    "sap",
+    "ibmi",
+    "sharepoint",
+    "servicenow",
+    "workday"
+  ],
+  "fromage": 7,
+  "poll_interval": 600,
+  "poll_jitter": 0.2,
+  "headless": true,
+  "use_proxy": true
+}
