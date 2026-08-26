@@ -1317,8 +1317,23 @@ class Controller:
         self.seeded = False
         self.last_success = 0.0
         self._thread: threading.Thread | None = None
+        self._filter_lock = threading.Lock()
 
     # -- lifecycle ------------------------------------------------------------
+
+    def update_title_filters(self, include: list[str], exclude: list[str]) -> bool:
+        """Swap the title filters on a running watch. Returns True if changed.
+
+        Only the title lists are hot-swappable: roles decide how many workers
+        exist, and the rest are baked into the search URL, so those still
+        need a restart.
+        """
+        with self._filter_lock:
+            if include == self.cfg.title_include and exclude == self.cfg.title_exclude:
+                return False
+            self.cfg.title_include = list(include)
+            self.cfg.title_exclude = list(exclude)
+            return True
 
     def start(self, once: bool = False, reseed: bool = False) -> None:
         self._thread = threading.Thread(
@@ -1617,11 +1632,11 @@ def launch_ui() -> None:
 
     include_box = make_term_box(
         0, "Title must include",
-        "Any one of these must appear. Leave empty to allow every title.",
+        "Any one of these must appear. Empty allows every title. Editable while running.",
         cfg.title_include)
     exclude_box = make_term_box(
         1, "Title must NOT include",
-        "Any match is dropped. Wins over the include list.",
+        "Any match is dropped. Wins over include. Editable while running.",
         cfg.title_exclude)
 
     # -- controls -------------------------------------------------------------
@@ -1720,8 +1735,9 @@ def launch_ui() -> None:
 
     def set_filters_state(enabled: bool) -> None:
         widget_state = "normal" if enabled else "disabled"
-        for box in (roles_text, include_box, exclude_box):
-            box.configure(state=widget_state)
+        roles_text.configure(state=widget_state)
+        # include/exclude stay editable on purpose — they apply to a running
+        # watch without stopping it.
         for frame in (right, jt_row, opts, toggles):
             for child in frame.winfo_children():
                 try:
@@ -1775,6 +1791,35 @@ def launch_ui() -> None:
             ui_queue.put(("stopped", None))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    pending_apply = {"id": None}
+
+    def apply_title_filters() -> None:
+        """Push the term boxes into the running watch and onto disk."""
+        pending_apply["id"] = None
+        include = parse_terms(include_box.get("1.0", "end"))
+        exclude = parse_terms(exclude_box.get("1.0", "end"))
+
+        controller = state.get("controller")
+        if controller and controller.is_running():
+            if controller.update_title_filters(include, exclude):
+                log.info("Filters updated live — %d include / %d block term(s); "
+                         "applies from the next batch of results.",
+                         len(include), len(exclude))
+        try:
+            stored = Config.load()
+            stored.title_include, stored.title_exclude = include, exclude
+            stored.save()
+        except Exception as exc:
+            log.error("Could not save title filters: %s", exc)
+
+    def schedule_apply(_event=None) -> None:
+        if pending_apply["id"] is not None:
+            root.after_cancel(pending_apply["id"])
+        pending_apply["id"] = root.after(1200, apply_title_filters)
+
+    for term_box in (include_box, exclude_box):
+        term_box.bind("<KeyRelease>", schedule_apply, add="+")
 
     start_btn.configure(command=do_start)
     stop_btn.configure(command=do_stop)
