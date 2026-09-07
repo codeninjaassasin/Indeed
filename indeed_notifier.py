@@ -74,6 +74,9 @@ SESSION_FILE = HERE / "indeed_session.json"   # persisted Indeed login cookies
 WIREPROXY_BIN = HERE / "wireproxy"            # optional: Surfshark WireGuard proxy binary
 WIREPROXY_CONF_DIR = HERE / "vpn"             # directory of *.conf wireproxy files
 
+# Read-only fork of the sibling project's proven proxy list. Never written.
+SIBLING_PROXY_FILE = HERE.parent / "Auto Email Scraper" / "autoemail" / "data" / "proxies.json"
+
 STATE_CAP = 5000              # keep the newest N job ids
 WORKER_ADVISORY = 10          # log a heads-up past this many concurrent browsers
 
@@ -86,19 +89,18 @@ CYCLE_TIMEOUT = 900           # s before a cycle gives up on stuck workers
 
 ALERT_AFTER_FAILURES = 3
 STALE_AFTER_HOURS = 6
-# On repeated failures the sleep grows, but never past this multiple of the
-# base poll interval — failing proxies should be retried soon (the pool keeps
-# refilling), not left for an hour.
-MAX_BACKOFF_MULT = 2
+# When all workers fail due to proxy blocks, wait this long before the next
+# attempt — much shorter than the normal poll interval so we keep trying.
+FAILURE_RETRY_SECONDS = 30
 
 # ── Proxy configuration ───────────────────────────────────────────────────────
 
-PROXY_POOL_SIZE = 25
+PROXY_POOL_SIZE = 50
 PROXY_VALIDATE_TIMEOUT = 8
-PROXY_COOLDOWN_SECONDS = 900
+PROXY_COOLDOWN_SECONDS = 120  # retry a failed free-list proxy after 2 min
 PROXY_REFILL_BATCH = 120
 PROXY_REFILL_INTERVAL = 90
-PROXY_WARMUP_WAIT = 180       # s to wait for a first proxy before polling
+PROXY_WARMUP_WAIT = 30        # sibling proxies load instantly; short warmup
 
 # Stage-2 content validation: a proxy that passes the cheap TCP handshake is
 # then asked to actually render Indeed job cards in a real browser. Only IPs
@@ -120,9 +122,9 @@ SOCKS5_BATCH_SHARE = 0.8
 # Safe list: proxies that have actually returned Indeed job cards. These are
 # tried before anything from the freshly-scraped pool, and get a shorter
 # cooldown after a failure because they are proven rather than speculative.
-SAFE_COOLDOWN_SECONDS = 300
-SAFE_LIST_CAP = 50
-SAFE_EVICT_CONSECUTIVE = 5   # evict after this many failures in a row, regardless of history
+SAFE_COOLDOWN_SECONDS = 60    # retry a safe-list proxy after 1 min (we have many)
+SAFE_LIST_CAP = 500           # room for the full sibling list
+SAFE_EVICT_CONSECUTIVE = 8   # evict only after 8 consecutive failures
 
 PROXY_LIST_URLS = [
     # SOCKS5 — these bypass Indeed's TLS-level blocks far better than HTTP CONNECT
@@ -287,6 +289,46 @@ class SafeList:
     def __len__(self) -> int:
         with self._lock:
             return len(self.entries)
+
+    def seed_from_sibling(self, path: Path) -> int:
+        """Load proven proxies from the sibling Auto Email Scraper project.
+
+        The file is read-only — we never write back to it.  Proxies are ranked
+        by (successes - blocks) and seeded into the safe list so they are tried
+        before anything from the free-list scrape.
+        """
+        if not path.exists():
+            return 0
+        try:
+            raw = json.loads(path.read_text())
+        except Exception as exc:
+            log.warning("Could not read sibling proxy list (%s): %s", path.name, exc)
+            return 0
+
+        entries = raw.get("proxies", []) + raw.get("reachable", [])
+        # Sort best first: most successes relative to blocks, most recently seen
+        def score(e):
+            return (e.get("successes", 0) - e.get("blocks", 0),
+                    str(e.get("lastSuccess") or e.get("checkedAt") or ""))
+
+        entries.sort(key=score, reverse=True)
+
+        added = 0
+        with self._lock:
+            for e in entries:
+                server = e.get("server")
+                if not server or server in self.entries:
+                    continue
+                self.entries[server] = {
+                    "successes": e.get("successes", 1),
+                    "failures": e.get("blocks", 0),
+                    "consecutive_failures": 0,
+                    "last_success": 0.0,
+                    "last_failure": 0.0,
+                }
+                added += 1
+            self._prune_locked()
+        return added
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -495,6 +537,10 @@ class ProxyManager:
         }
 
         if self.enabled:
+            n = self.safe.seed_from_sibling(SIBLING_PROXY_FILE)
+            if n:
+                log.info("Seeded %d proven proxy/proxies from sibling project (best-first).", n)
+                self._first_proxy.set()
             self._start_refill_thread()
         else:
             log.info("Proxy rotation disabled — using a direct connection.")
@@ -1695,11 +1741,17 @@ class Controller:
                 if once or self.stop_event.is_set():
                     break
 
-                backoff = min(1 + consecutive_failures, MAX_BACKOFF_MULT)
-                delay = (self.cfg.poll_interval * backoff *
-                         random.uniform(1 - self.cfg.poll_jitter, 1 + self.cfg.poll_jitter))
-                log.info("Next cycle in %ds.", int(delay))
-                self._status(state=f"sleeping {int(delay)}s")
+                if consecutive_failures > 0:
+                    # All proxies failed — keep retrying quickly until we find
+                    # a working one instead of sleeping for the full poll interval.
+                    delay = FAILURE_RETRY_SECONDS * random.uniform(0.8, 1.2)
+                    log.info("Proxy cycle failed — retrying in %ds (trying next proxies).", int(delay))
+                    self._status(state=f"retrying in {int(delay)}s")
+                else:
+                    jitter = random.uniform(1 - self.cfg.poll_jitter, 1 + self.cfg.poll_jitter)
+                    delay = self.cfg.poll_interval * jitter
+                    log.info("Next cycle in %ds.", int(delay))
+                    self._status(state=f"sleeping {int(delay)}s")
                 self.stop_event.wait(delay)
         except Exception as exc:
             log.exception("Controller crashed: %s", exc)
