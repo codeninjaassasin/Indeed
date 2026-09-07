@@ -1,20 +1,32 @@
-# Secrets — never commit. .env holds the Mattermost webhook URL.
-.env
-
-# Local TLS material (internal CA export; regenerate per machine — see README)
-certs/
-
-# Runtime state written by the app
+# Runtime state — machine-specific, not for version control
 seen_jobs.json
 safe_proxies.json
+indeed_session.json
+
+# Contains live webhook URL — keep the .example, not the real one
+.env
+
+# Config has user-specific filters — keep example, not the real one
 config.json
-*.tmp
+
+# Certs / CA bundles
+certs/
+
+# VPN private keys are sensitive
+vpn/*.conf
+vpn/.env
 
 # Python
 .venv/
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
 
-# Browser profiles, if any are recreated
-.chrome_profile/
-.indeed_profile/
+# Wireproxy binary (platform-specific)
+wireproxy
+
+# macOS
+.DS_Store

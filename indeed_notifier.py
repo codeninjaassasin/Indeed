@@ -18,8 +18,9 @@ Design
       and every worker rebuilds its browser onto the new one.
     • Headless by default — a challenge cannot be solved by hand, so it is
       treated as a proxy failure and triggers rotation instead.
-    • seen_jobs.json maps job-id -> first-seen timestamp, so duplicates are
-      impossible and pruning actually drops the OLDEST entries.
+    • seen_jobs.json maps job-id -> first-seen timestamp AND role@company ->
+      first-seen, so a job repeats neither by id nor as the same role at the
+      same company (reposts / different ids collapse); pruning drops the OLDEST.
     • safe_proxies.json remembers every proxy that actually returned job
       cards. On a block the next proxy is taken from that safe list first,
       and only once it is exhausted does discovery take over.
@@ -69,6 +70,9 @@ STATE_FILE = HERE / "seen_jobs.json"
 CONFIG_FILE = HERE / "config.json"
 SAFE_LIST_FILE = HERE / "safe_proxies.json"
 ENV_FILE = HERE / ".env"
+SESSION_FILE = HERE / "indeed_session.json"   # persisted Indeed login cookies
+WIREPROXY_BIN = HERE / "wireproxy"            # optional: Surfshark WireGuard proxy binary
+WIREPROXY_CONF_DIR = HERE / "vpn"             # directory of *.conf wireproxy files
 
 STATE_CAP = 5000              # keep the newest N job ids
 WORKER_ADVISORY = 10          # log a heads-up past this many concurrent browsers
@@ -82,6 +86,10 @@ CYCLE_TIMEOUT = 900           # s before a cycle gives up on stuck workers
 
 ALERT_AFTER_FAILURES = 3
 STALE_AFTER_HOURS = 6
+# On repeated failures the sleep grows, but never past this multiple of the
+# base poll interval — failing proxies should be retried soon (the pool keeps
+# refilling), not left for an hour.
+MAX_BACKOFF_MULT = 2
 
 # ── Proxy configuration ───────────────────────────────────────────────────────
 
@@ -91,6 +99,17 @@ PROXY_COOLDOWN_SECONDS = 900
 PROXY_REFILL_BATCH = 120
 PROXY_REFILL_INTERVAL = 90
 PROXY_WARMUP_WAIT = 180       # s to wait for a first proxy before polling
+
+# Stage-2 content validation: a proxy that passes the cheap TCP handshake is
+# then asked to actually render Indeed job cards in a real browser. Only IPs
+# Indeed *serves* (not merely reachable ones) pass — datacenter IPs get
+# bounced to a login/challenge wall and are rejected here. Proven proxies are
+# promoted straight to the safe list. Browsers are heavy, so keep this batch
+# small and its concurrency low.
+PROXY_CONTENT_VALIDATE = True
+PROXY_CONTENT_CONCURRENCY = 4
+PROXY_CONTENT_BATCH = 20       # TCP-passers to browser-test per refill cycle
+PROXY_CONTENT_TIMEOUT = 22     # s for the challenge to clear into job cards
 
 # Measured against the live lists: of 250 candidates each, 0/250 free HTTP
 # proxies could reach indeed.com over TLS, while 98/250 SOCKS5 relays opened
@@ -103,22 +122,32 @@ SOCKS5_BATCH_SHARE = 0.8
 # cooldown after a failure because they are proven rather than speculative.
 SAFE_COOLDOWN_SECONDS = 300
 SAFE_LIST_CAP = 50
-SAFE_EVICT_MARGIN = 10        # drop once failures exceed successes by this much
+SAFE_EVICT_CONSECUTIVE = 5   # evict after this many failures in a row, regardless of history
 
 PROXY_LIST_URLS = [
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=protocolipport&format=text",
+    # SOCKS5 — these bypass Indeed's TLS-level blocks far better than HTTP CONNECT
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=socks5&proxy_format=protocolipport&format=text",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+    # HTTP as fallback — low hit rate against Indeed but worth scanning
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=protocolipport&format=text",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
-    "https://api.openproxylist.xyz/http.txt",
 ]
 
-# Sources that publish bare "ip:port" but are actually SOCKS5, so the scheme
-# has to be supplied by us rather than guessed as http://.
+# Sources that publish bare "ip:port" lines that are actually SOCKS5.
 SOCKS5_BARE_SOURCES = {
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
 }
 
 _HOSTPORT_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})$")
@@ -189,6 +218,7 @@ class SafeList:
             self.entries[str(server)] = {
                 "successes": int(stats.get("successes", 0)),
                 "failures": int(stats.get("failures", 0)),
+                "consecutive_failures": int(stats.get("consecutive_failures", 0)),
                 "last_success": float(stats.get("last_success", 0)),
                 "last_failure": float(stats.get("last_failure", 0)),
             }
@@ -205,10 +235,13 @@ class SafeList:
 
     def record_success(self, server: str) -> None:
         with self._lock:
-            entry = self.entries.setdefault(
-                server, {"successes": 0, "failures": 0, "last_success": 0.0, "last_failure": 0.0})
+            entry = self.entries.setdefault(server, {
+                "successes": 0, "failures": 0, "consecutive_failures": 0,
+                "last_success": 0.0, "last_failure": 0.0,
+            })
             first_time = entry["successes"] == 0
             entry["successes"] += 1
+            entry["consecutive_failures"] = 0
             entry["last_success"] = time.time()
             if first_time:
                 log.info("Safe list + %s (proven working).", server)
@@ -221,10 +254,12 @@ class SafeList:
             if not entry:
                 return
             entry["failures"] += 1
+            entry["consecutive_failures"] = entry.get("consecutive_failures", 0) + 1
             entry["last_failure"] = time.time()
-            if entry["failures"] - entry["successes"] > SAFE_EVICT_MARGIN:
+            if entry["consecutive_failures"] >= SAFE_EVICT_CONSECUTIVE:
                 del self.entries[server]
-                log.info("Safe list − %s (stopped working).", server)
+                log.info("Safe list − %s (%d consecutive failures).",
+                         server, SAFE_EVICT_CONSECUTIVE)
             self._save_locked()
 
     @staticmethod
@@ -428,18 +463,36 @@ class SharedProxy:
 # ── Proxy manager ─────────────────────────────────────────────────────────────
 
 class ProxyManager:
-    """Fetches, validates and hands out free HTTP/SOCKS5 proxies."""
+    """Fetches, validates and hands out free HTTP/SOCKS5 proxies.
 
-    def __init__(self, enabled: bool = True):
+    When local_proxies is given (e.g. Surfshark wireproxy URLs), those are
+    used as the primary pool and free-list scraping is skipped entirely.
+    """
+
+    def __init__(self, enabled: bool = True, local_proxies: list[str] | None = None):
         self.enabled = enabled
         self.pool: list[dict] = []
         self.failures: dict[str, float] = {}
         self.safe = SafeList()
         self._lock = threading.Lock()
+        self._local_proxies: list[str] = local_proxies or []
         self._refill_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._first_proxy = threading.Event()
         self._session = self._create_session()
+
+        # ── tracing counters (read by the UI) ───────────────────────────────
+        self._stats_lock = threading.Lock()
+        self._stats = {
+            "candidates": 0,      # unique proxies fetched last cycle
+            "tcp_tested": 0,      # stage-1 handshake attempts last cycle
+            "tcp_ok": 0,          # stage-1 reachable last cycle
+            "probed_total": 0,    # cumulative browser content-checks
+            "served_total": 0,    # cumulative proxies that returned job cards
+            "testing_now": 0,     # proxies currently in a browser content-check
+            "cycles": 0,          # refill cycles completed
+            "last_served": [],    # server strings that served cards last cycle
+        }
 
         if self.enabled:
             self._start_refill_thread()
@@ -461,6 +514,14 @@ class ProxyManager:
         if self._refill_thread and self._refill_thread.is_alive():
             return
         self._stop.clear()
+        # Seed with local VPN proxies immediately so the first cycle doesn't
+        # have to wait for the free-list scrape to finish.
+        if self._local_proxies:
+            with self._lock:
+                for url in self._local_proxies:
+                    self.pool.append({"server": url})
+            self._first_proxy.set()
+            log.info("Proxy pool: %d local VPN proxy/proxies loaded (Surfshark).", len(self._local_proxies))
         self._refill_thread = threading.Thread(target=self._refill_loop, daemon=True)
         self._refill_thread.start()
 
@@ -494,17 +555,41 @@ class ProxyManager:
     def _refill_loop(self) -> None:
         while not self._stop.is_set():
             try:
+                # When local VPN proxies are configured, just keep them topped up;
+                # skip the free-list scrape entirely (it would almost always fail).
+                if self._local_proxies:
+                    if self._stop.wait(PROXY_REFILL_INTERVAL):
+                        break
+                    with self._lock:
+                        known = {p["server"] for p in self.pool}
+                        for url in self._local_proxies:
+                            if url not in known and url not in self.failures:
+                                self.pool.append({"server": url})
+                    continue
+
                 if self.pool_size() >= PROXY_POOL_SIZE:
                     self._sleep(PROXY_REFILL_INTERVAL)
                     continue
 
                 candidates = self._fetch_candidates()
+                self._stat_set(candidates=len(candidates))
                 if not candidates:
                     log.debug("No proxy candidates fetched.")
                     self._sleep(PROXY_REFILL_INTERVAL)
                     continue
 
-                verified = self._validate_batch(self._compose_batch(candidates))
+                # Stage 1 — cheap TCP/handshake reachability filter.
+                batch = self._compose_batch(candidates)
+                reachable = self._validate_batch(batch)
+                self._stat_set(tcp_tested=len(batch), tcp_ok=len(reachable))
+
+                # Stage 2 — authoritative: does the proxy actually get served
+                # Indeed job cards in a real browser? Only these are trusted.
+                if reachable and PROXY_CONTENT_VALIDATE:
+                    verified = self._content_verify_batch(reachable)
+                else:
+                    verified = reachable
+                self._stat_inc("cycles")
 
                 if verified:
                     with self._lock:
@@ -608,6 +693,87 @@ class ProxyManager:
         ok = self._validate_socks5(proxy_url) if scheme == "socks5" else self._validate_http(proxy_url)
         return {"server": proxy_url} if ok else None
 
+    # -- stage 2: content verification (real browser → real job cards) --------
+
+    def _content_verify_batch(self, reachable: list[dict]) -> list[dict]:
+        """Browser-test the TCP-reachable proxies; keep only those Indeed
+        actually serves job cards through. Winners are promoted to the safe
+        list so they survive restarts and are tried first next time."""
+        batch = reachable[:PROXY_CONTENT_BATCH]
+        log.info("Content-checking %d reachable proxy/proxies through a real "
+                 "browser…", len(batch))
+        self._stat_set(testing_now=len(batch), last_served=[])
+        served: list[dict] = []
+        try:
+            with ThreadPoolExecutor(max_workers=PROXY_CONTENT_CONCURRENCY) as executor:
+                futures = {executor.submit(self._content_verify_one, p["server"]): p
+                           for p in batch}
+                for future in as_completed(futures):
+                    self._stat_inc("probed_total")
+                    self._stat_inc("testing_now", -1)
+                    if self._stop.is_set():
+                        break
+                    try:
+                        ok = future.result()
+                    except Exception:
+                        ok = False
+                    if ok:
+                        server = futures[future]["server"]
+                        served.append({"server": server})
+                        self.safe.record_success(server)   # bank it — proven once
+                        self._stat_inc("served_total")
+                        with self._stats_lock:
+                            self._stats["last_served"] = \
+                                self._stats.get("last_served", []) + [server]
+                        log.info("  ✅ proxy serves Indeed: %s", server)
+        finally:
+            self._stat_set(testing_now=0)
+        if not served:
+            log.info("  no proxy served job cards this cycle.")
+        return served
+
+    @staticmethod
+    def _content_verify_one(proxy_url: str) -> bool:
+        """Load Indeed's job search through the proxy in a headless browser and
+        report whether real job cards rendered (vs a login/challenge wall)."""
+        from playwright.sync_api import sync_playwright
+        url = "https://www.indeed.com/jobs?q=Software+Engineer&l=Remote"
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    proxy={"server": proxy_url},
+                    args=["--disable-blink-features=AutomationControlled",
+                          "--no-sandbox", "--disable-dev-shm-usage"])
+                ctx = browser.new_context(user_agent=UA,
+                                          viewport={"width": 1440, "height": 900},
+                                          locale="en-US")
+                ctx.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+                page = ctx.new_page()
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                except Exception:
+                    browser.close()
+                    return False
+                deadline = time.monotonic() + PROXY_CONTENT_TIMEOUT
+                served = False
+                while time.monotonic() < deadline:
+                    try:
+                        html = page.content()
+                    except Exception:
+                        break
+                    if "data-jk=" in html or "mosaic-provider-jobcards" in html:
+                        served = True
+                        break
+                    if "login-required" in page.url:
+                        break
+                    time.sleep(2)
+                browser.close()
+                return served
+        except Exception:
+            return False
+
     @staticmethod
     def _validate_http(proxy_url: str) -> bool:
         """A CONNECT-capable proxy must be able to reach Indeed over TLS."""
@@ -704,6 +870,33 @@ class ProxyManager:
 
     def safe_size(self) -> int:
         return len(self.safe)
+
+    # -- tracing --------------------------------------------------------------
+
+    def _stat_set(self, **kw) -> None:
+        with self._stats_lock:
+            self._stats.update(kw)
+
+    def _stat_inc(self, key: str, by: int = 1) -> None:
+        with self._stats_lock:
+            self._stats[key] = self._stats.get(key, 0) + by
+
+    def stats(self) -> dict:
+        """Live proxy funnel snapshot for the UI."""
+        now = time.time()
+        with self._lock:
+            pool = len(self.pool)
+            blocked = sum(1 for t in self.failures.values()
+                          if now - t <= PROXY_COOLDOWN_SECONDS)
+        with self._stats_lock:
+            s = dict(self._stats)
+        s.update({
+            "enabled": self.enabled,
+            "pool": pool,              # content-verified, ready to hand out
+            "safe": self.safe_size(),  # proven, persisted across restarts
+            "blocked": blocked,        # in failure cooldown
+        })
+        return s
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -813,6 +1006,17 @@ def _normalise_title(text: str) -> str:
     return " " + _NON_WORD_RE.sub(" ", (text or "").lower()).strip() + " "
 
 
+def pair_key(job: "Job") -> str:
+    """Identity for role+company deduplication.
+
+    Two postings for the same role at the same company collapse to one key,
+    even when Indeed assigns them different job ids (reposts, or the same job
+    surfacing under several role searches). Title and company are normalised
+    the same way filters are, so 'Full-Stack Engineer' == 'Full Stack Engineer'.
+    """
+    return _normalise_title(job.title).strip() + " @@ " + _normalise_title(job.company).strip()
+
+
 def title_matches(title: str, terms: list[str]) -> str | None:
     """Return the first term present in `title` as a whole word, else None."""
     haystack = _normalise_title(title)
@@ -875,18 +1079,48 @@ class IndeedWorker(threading.Thread):
         self._pw = sync_playwright().start()
         try:
             launch_opts: dict = {
-                "channel": "chrome",
                 "headless": self.cfg.headless,
-                "args": ["--disable-blink-features=AutomationControlled"],
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
             }
+            # Use installed Chrome if available (less detectable than Chromium),
+            # but fall back to Playwright's bundled Chromium without crashing.
+            try:
+                test_browser = self._pw.chromium.launch(channel="chrome", headless=True)
+                test_browser.close()
+                launch_opts["channel"] = "chrome"
+            except Exception:
+                pass
             if proxy:
                 launch_opts["proxy"] = {"server": proxy["server"]}
             self._browser = self._pw.chromium.launch(**launch_opts)
-            self._ctx = self._browser.new_context(
-                user_agent=UA,
-                viewport={"width": 1440, "height": 950},
-                locale="en-US",
-            )
+            ctx_opts: dict = {
+                "user_agent": UA,
+                "viewport": {"width": 1440, "height": 950},
+                "locale": "en-US",
+            }
+            # Reuse a saved logged-in Indeed session if one exists. Without it,
+            # Indeed redirects anonymous traffic to a login wall behind
+            # Cloudflare Turnstile that a headless browser cannot pass.
+            if SESSION_FILE.exists():
+                ctx_opts["storage_state"] = str(SESSION_FILE)
+            self._ctx = self._browser.new_context(**ctx_opts)
+            # Mask automation fingerprints that Indeed/Cloudflare detect
+            self._ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+                window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){},
+                                 app: {isInstalled: false}};
+                const origQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (p) =>
+                    p.name === 'notifications'
+                        ? Promise.resolve({state: Notification.permission})
+                        : origQuery(p);
+            """)
             self._ctx.set_default_navigation_timeout(NAV_TIMEOUT)
             self._page = self._ctx.new_page()
         except Exception:
@@ -1095,41 +1329,52 @@ class IndeedWorker(threading.Thread):
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
-def load_state() -> tuple[dict[str, float], bool, float]:
-    """Return (guid -> first-seen epoch, seeded, last_success)."""
+def load_state() -> tuple[dict[str, float], dict[str, float], bool, float]:
+    """Return (guid -> first-seen epoch, role@company -> first-seen epoch,
+    seeded, last_success)."""
     if not STATE_FILE.exists():
-        return {}, False, 0.0
+        return {}, {}, False, 0.0
     try:
         raw = json.loads(STATE_FILE.read_text())
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
         log.error("State file unreadable (%s) — starting fresh.", exc)
-        return {}, False, 0.0
+        return {}, {}, False, 0.0
 
     now = time.time()
     if isinstance(raw, list):                                   # legacy: bare list
         log.info("Migrating legacy state file (%d keys).", len(raw))
-        return {g: now for g in raw}, True, 0.0
+        return {g: now for g in raw}, {}, True, 0.0
     if isinstance(raw, dict) and "guids" in raw:                # legacy: {"guids": [...]}
         guids = raw.get("guids") or []
         log.info("Migrating state file (%d keys).", len(guids))
-        return ({g: now for g in guids},
+        return ({g: now for g in guids}, {},
                 bool(raw.get("seeded")),
                 float(raw.get("last_success", 0)))
 
     jobs = raw.get("jobs") or {}
     seen = {str(g): float(t) for g, t in jobs.items()}
-    return seen, bool(raw.get("seeded")), float(raw.get("last_success", 0))
+    pairs_raw = raw.get("pairs") or {}
+    pairs = {str(k): float(t) for k, t in pairs_raw.items()}
+    return seen, pairs, bool(raw.get("seeded")), float(raw.get("last_success", 0))
 
 
-def save_state(seen: dict[str, float], seeded: bool, last_success: float) -> None:
+def _cap(d: dict[str, float]) -> None:
+    """Drop the OLDEST entries once a seen-map exceeds STATE_CAP, in place."""
+    if len(d) > STATE_CAP:
+        newest = sorted(d.items(), key=lambda kv: kv[1], reverse=True)[:STATE_CAP]
+        d.clear()
+        d.update(newest)
+
+
+def save_state(seen: dict[str, float], seen_pairs: dict[str, float],
+               seeded: bool, last_success: float) -> None:
     """Persist state, dropping the OLDEST ids once over STATE_CAP."""
-    if len(seen) > STATE_CAP:
-        newest = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:STATE_CAP]
-        seen.clear()
-        seen.update(newest)
+    _cap(seen)
+    _cap(seen_pairs)
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(
-        {"seeded": seeded, "last_success": last_success, "jobs": seen}, indent=2
+        {"seeded": seeded, "last_success": last_success,
+         "jobs": seen, "pairs": seen_pairs}, indent=2
     ))
     tmp.replace(STATE_FILE)
 
@@ -1308,12 +1553,21 @@ class Controller:
         self.on_job = on_job                    # callback(Job) for the UI table
         self.on_status = on_status              # callback(dict) for the status bar
         self.stop_event = threading.Event()
-        self.proxy_manager = ProxyManager(enabled=cfg.use_proxy)
+        self._wireproxy: WireproxyManager | None = None
+        local_proxies: list[str] = []
+        if cfg.use_proxy:
+            wm = WireproxyManager()
+            if wm.available():
+                log.info("wireproxy binary + vpn/ configs found — starting Surfshark tunnels…")
+                self._wireproxy = wm
+                local_proxies = wm.start(warmup=8.0)
+        self.proxy_manager = ProxyManager(enabled=cfg.use_proxy, local_proxies=local_proxies)
         self.shared = SharedProxy(self.proxy_manager)
         self.tasks: queue.Queue = queue.Queue()
         self.results: queue.Queue = queue.Queue()
         self.workers: list[IndeedWorker] = []
         self.seen: dict[str, float] = {}
+        self.seen_pairs: dict[str, float] = {}   # role@company -> first-seen
         self.seeded = False
         self.last_success = 0.0
         self._thread: threading.Thread | None = None
@@ -1347,6 +1601,8 @@ class Controller:
         if self._thread:
             self._thread.join(timeout=timeout)
         self.proxy_manager.stop()
+        if self._wireproxy:
+            self._wireproxy.stop()
 
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
@@ -1375,9 +1631,9 @@ class Controller:
     # -- main loop ------------------------------------------------------------
 
     def _run(self, once: bool, reseed: bool) -> None:
-        self.seen, self.seeded, self.last_success = load_state()
+        self.seen, self.seen_pairs, self.seeded, self.last_success = load_state()
         if reseed:
-            self.seen, self.seeded = {}, False
+            self.seen, self.seen_pairs, self.seeded = {}, {}, False
             log.info("--reseed: discarding previous state.")
 
         roles = self.cfg.roles
@@ -1419,7 +1675,7 @@ class Controller:
                         log.info("✅ %d new job(s).", len(new_jobs))
                     else:
                         log.info("No new jobs.")
-                    save_state(self.seen, self.seeded, self.last_success)
+                    save_state(self.seen, self.seen_pairs, self.seeded, self.last_success)
                 else:
                     consecutive_failures += 1
                     log.error("All %d role(s) failed (%d cycle(s) in a row).",
@@ -1439,7 +1695,7 @@ class Controller:
                 if once or self.stop_event.is_set():
                     break
 
-                backoff = 1 + min(consecutive_failures, 5)
+                backoff = min(1 + consecutive_failures, MAX_BACKOFF_MULT)
                 delay = (self.cfg.poll_interval * backoff *
                          random.uniform(1 - self.cfg.poll_jitter, 1 + self.cfg.poll_jitter))
                 log.info("Next cycle in %ds.", int(delay))
@@ -1448,7 +1704,7 @@ class Controller:
         except Exception as exc:
             log.exception("Controller crashed: %s", exc)
         finally:
-            save_state(self.seen, self.seeded, self.last_success)
+            save_state(self.seen, self.seen_pairs, self.seeded, self.last_success)
             self.stop_event.set()
             for _ in self.workers:
                 self.tasks.put(None)
@@ -1494,9 +1750,15 @@ class Controller:
             jobs = [j for j in payload if passes_filters(j, self.cfg)]
             fresh = 0
             for job in jobs:
-                if job.guid in self.seen:            # dedup against known ids
+                pkey = pair_key(job)
+                # Drop exact reposts (same id) AND any other posting for the
+                # same role at the same company, even under a different id.
+                if job.guid in self.seen or pkey in self.seen_pairs:
+                    self.seen[job.guid] = now
+                    self.seen_pairs[pkey] = now
                     continue
                 self.seen[job.guid] = now
+                self.seen_pairs[pkey] = now
                 new_jobs.append(job)
                 fresh += 1
                 if announce:
@@ -1530,6 +1792,9 @@ def launch_ui() -> None:
     root.title("Indeed Job Notifier")
     root.geometry("1080x760")
     root.minsize(920, 620)
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(200, lambda: root.attributes("-topmost", False))
 
     state = {"controller": None}
 
@@ -1889,7 +2154,649 @@ def launch_ui() -> None:
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.after(200, drain)
     log.info("Ready. Edit your filters, then press Start.")
+    root.update_idletasks()
+    root.update()
     root.mainloop()
+
+
+# ── Web UI ────────────────────────────────────────────────────────────────────
+
+_WEB_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Indeed Job Notifier</title>
+<style>
+:root{--bg:#0f1117;--surf:#1a1d27;--bd:#2d3148;--tx:#e2e8f0;--mu:#64748b;
+      --ac:#4f8ef7;--gr:#22c55e;--re:#ef4444;--ye:#f59e0b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font:13px/1.5 Menlo,monospace;height:100vh;overflow:hidden}
+header{display:flex;align-items:center;gap:10px;padding:10px 18px;
+       border-bottom:1px solid var(--bd);background:var(--surf);flex-shrink:0}
+header h1{font-size:14px;font-weight:600;flex:1}
+#status-text{font-size:12px;color:var(--mu)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--mu);flex-shrink:0}
+.dot.on{background:var(--gr);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+button{padding:5px 14px;border-radius:6px;border:none;cursor:pointer;
+       font:13px/1 Menlo,monospace;font-weight:600;transition:opacity .15s}
+button:hover{opacity:.8}
+#btn-start{background:var(--gr);color:#000}
+#btn-stop{background:var(--re);color:#fff}
+#btn-start:disabled,#btn-stop:disabled{opacity:.4;cursor:not-allowed}
+#btn-save{background:var(--ac);color:#fff}
+.badge{font-size:10px;padding:2px 7px;border-radius:4px;font-weight:600}
+.badge-off{background:var(--re);color:#fff}
+.badge-on{background:var(--gr);color:#000}
+.layout{display:grid;grid-template-columns:360px 1fr;height:calc(100vh - 45px);overflow:hidden}
+aside{border-right:1px solid var(--bd);overflow-y:auto;display:flex;flex-direction:column}
+.filters{padding:14px;flex:1}
+.fh{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--mu);margin-bottom:10px}
+.field{margin-bottom:12px}
+.field>label{display:block;font-size:11px;color:var(--mu);margin-bottom:3px}
+textarea,input[type=text],input[type=number]{
+  width:100%;background:var(--bg);border:1px solid var(--bd);border-radius:5px;
+  color:var(--tx);padding:5px 8px;font:12px/1.4 Menlo,monospace;resize:vertical}
+textarea:focus,input:focus{outline:none;border-color:var(--ac)}
+.cg{display:flex;flex-direction:column;gap:5px}
+.cg label,.rg label{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--tx)}
+.rg{display:flex;flex-direction:column;gap:5px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.save-row{padding:10px 14px;border-top:1px solid var(--bd);display:flex;justify-content:flex-end}
+main{display:flex;flex-direction:column;overflow:hidden}
+.tabs{display:flex;border-bottom:1px solid var(--bd);background:var(--surf);flex-shrink:0}
+.tab{padding:7px 18px;font-size:12px;cursor:pointer;border-bottom:2px solid transparent;
+     color:var(--mu);transition:color .15s}
+.tab.active{color:var(--tx);border-bottom-color:var(--ac)}
+.panel{flex:1;overflow:hidden;display:none;flex-direction:column}
+.panel.active{display:flex}
+#log-out{flex:1;overflow-y:auto;padding:8px 12px;font-size:11.5px;line-height:1.7;
+          white-space:pre-wrap;word-break:break-all}
+.INFO{color:#94a3b8}.WARNING{color:var(--ye)}.ERROR{color:var(--re)}
+#jobs-panel{overflow-y:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{position:sticky;top:0;background:var(--surf);padding:7px 10px;text-align:left;
+   color:var(--mu);font-size:10px;text-transform:uppercase;border-bottom:1px solid var(--bd)}
+td{padding:7px 10px;border-bottom:1px solid var(--bd);vertical-align:top}
+td a{color:var(--ac);text-decoration:none}
+td a:hover{text-decoration:underline}
+.ea{background:var(--gr);color:#000;font-size:9px;padding:1px 4px;border-radius:3px;vertical-align:middle}
+#proxies-panel{overflow-y:auto}
+.px-wrap{padding:16px}
+.px-h{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--mu);
+      margin:14px 0 8px}
+.px-h:first-child{margin-top:0}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.tile{background:var(--surf);border:1px solid var(--bd);border-radius:8px;padding:12px 14px}
+.tile-hi{border-color:var(--ac)}
+.tile-ok .tn{color:var(--gr)}
+.tn{font-size:26px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.tl{font-size:11px;color:var(--tx);margin-top:6px;line-height:1.35}
+.tl span{color:var(--mu)}
+.px-hdr-badge{font-size:11px;color:var(--mu);margin-left:6px}
+.px-list{background:var(--surf);border:1px solid var(--bd);border-radius:8px;padding:10px 12px;
+         font-size:11.5px;color:var(--gr);white-space:pre-wrap;word-break:break-all;min-height:32px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Indeed Job Notifier</h1>
+  <span id="px-summary" class="px-hdr-badge">proxies: —</span>
+  <span id="status-text">idle</span>
+  <div class="dot" id="dot"></div>
+  <button id="btn-start">&#9654; Start</button>
+  <button id="btn-stop">&#9646;&#9646; Stop</button>
+</header>
+<div class="layout">
+  <aside>
+    <div class="filters">
+      <div class="fh">Filters</div>
+      <div class="field">
+        <label>Roles (one per line — each gets its own worker)</label>
+        <textarea id="roles" rows="7"></textarea>
+      </div>
+      <div class="field">
+        <label>Region</label>
+        <div class="rg">
+          <label><input type="radio" name="region" value="us_remote"> US Remote</label>
+          <label><input type="radio" name="region" value="worldwide_remote"> Worldwide Remote</label>
+        </div>
+      </div>
+      <div class="field">
+        <label>Application</label>
+        <div class="cg">
+          <label><input type="checkbox" id="easy_apply_only"> Easy Apply only</label>
+        </div>
+      </div>
+      <div class="field">
+        <label>Job types</label>
+        <div class="cg">
+          <label><input type="checkbox" class="jt" value="fulltime"> Full-time</label>
+          <label><input type="checkbox" class="jt" value="parttime"> Part-time</label>
+          <label><input type="checkbox" class="jt" value="contract"> Contract</label>
+        </div>
+      </div>
+      <div class="field">
+        <label>Title must include (comma-separated)</label>
+        <input type="text" id="title_include">
+      </div>
+      <div class="field">
+        <label>Title must NOT include (comma-separated)</label>
+        <input type="text" id="title_exclude">
+      </div>
+      <div class="row2">
+        <div class="field"><label>Posted within (days)</label><input type="number" id="fromage" min="1" max="30"></div>
+        <div class="field"><label>Poll interval (s)</label><input type="number" id="poll_interval" min="60"></div>
+      </div>
+      <div class="field">
+        <div class="cg">
+          <label><input type="checkbox" id="use_proxy"> Use proxy rotation</label>
+          <label><input type="checkbox" id="headless"> Headless browser</label>
+        </div>
+      </div>
+    </div>
+    <div class="save-row"><button id="btn-save">Save filters</button></div>
+  </aside>
+  <main>
+    <div class="tabs">
+      <div class="tab active" data-tab="log">Logs</div>
+      <div class="tab" data-tab="jobs">Jobs <span id="jcount"></span></div>
+      <div class="tab" data-tab="proxies">Proxies</div>
+    </div>
+    <div class="panel active" id="log-panel"><div id="log-out"></div></div>
+    <div class="panel" id="jobs-panel">
+      <table>
+        <thead><tr><th>Title</th><th>Company</th><th>Location</th><th>Salary</th></tr></thead>
+        <tbody id="jobs-body"></tbody>
+      </table>
+    </div>
+    <div class="panel" id="proxies-panel">
+      <div class="px-wrap">
+        <div class="px-h">Live — ready to use now</div>
+        <div class="tiles">
+          <div class="tile tile-hi"><div class="tn" id="px-pool">0</div><div class="tl">Verified pool<br><span>serving job cards</span></div></div>
+          <div class="tile tile-hi"><div class="tn" id="px-safe">0</div><div class="tl">Safe list<br><span>proven &amp; saved</span></div></div>
+          <div class="tile"><div class="tn" id="px-testing">0</div><div class="tl">Testing now<br><span>in browser check</span></div></div>
+          <div class="tile"><div class="tn" id="px-blocked">0</div><div class="tl">Blocked<br><span>in cooldown</span></div></div>
+        </div>
+        <div class="px-h">This discovery cycle</div>
+        <div class="tiles">
+          <div class="tile"><div class="tn" id="px-cand">0</div><div class="tl">Candidates<br><span>fetched from lists</span></div></div>
+          <div class="tile"><div class="tn" id="px-tcp">0</div><div class="tl">TCP reachable<br><span>of <span id="px-tcptested">0</span> tested</span></div></div>
+          <div class="tile"><div class="tn" id="px-cycles">0</div><div class="tl">Cycles<br><span>completed</span></div></div>
+        </div>
+        <div class="px-h">Cumulative (since start)</div>
+        <div class="tiles">
+          <div class="tile"><div class="tn" id="px-probed">0</div><div class="tl">Browser-probed<br><span>real /jobs loads</span></div></div>
+          <div class="tile tile-ok"><div class="tn" id="px-served">0</div><div class="tl">Served cards<br><span>promoted to safe</span></div></div>
+          <div class="tile"><div class="tn" id="px-rate">—</div><div class="tl">Hit rate<br><span>served / probed</span></div></div>
+        </div>
+        <div class="px-h">Served this cycle</div>
+        <div id="px-served-list" class="px-list">none yet</div>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let jcount=0;
+
+document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');
+  $(`${t.dataset.tab}-panel`).classList.add('active');
+}));
+
+async function loadCfg(){
+  const c=await fetch('/api/config').then(r=>r.json());
+  $('roles').value=(c.roles||[]).join('\n');
+  document.querySelectorAll('input[name=region]').forEach(r=>r.checked=r.value===c.region);
+  $('easy_apply_only').checked=!!c.easy_apply_only;
+  document.querySelectorAll('.jt').forEach(cb=>cb.checked=(c.job_types||[]).includes(cb.value));
+  $('title_include').value=(c.title_include||[]).join(', ');
+  $('title_exclude').value=(c.title_exclude||[]).join(', ');
+  $('fromage').value=c.fromage??7;
+  $('poll_interval').value=c.poll_interval??600;
+  $('use_proxy').checked=c.use_proxy!==false;
+  $('headless').checked=c.headless!==false;
+}
+
+function collectCfg(){
+  const terms=s=>s.split(/[,\n]+/).map(t=>t.trim()).filter(Boolean);
+  return{
+    roles:$('roles').value.split('\n').map(r=>r.trim()).filter(Boolean),
+    region:document.querySelector('input[name=region]:checked')?.value||'us_remote',
+    easy_apply_only:$('easy_apply_only').checked,
+    job_types:[...$('jobs-panel')||document.querySelectorAll('.jt:checked')].map(cb=>cb.value),
+    title_include:terms($('title_include').value),
+    title_exclude:terms($('title_exclude').value),
+    fromage:parseInt($('fromage').value)||7,
+    poll_interval:parseInt($('poll_interval').value)||600,
+    use_proxy:$('use_proxy').checked,
+    headless:$('headless').checked,
+  };
+}
+
+// fix collectCfg job_types
+function collectCfgFixed(){
+  const terms=s=>s.split(/[,\n]+/).map(t=>t.trim()).filter(Boolean);
+  return{
+    roles:$('roles').value.split('\n').map(r=>r.trim()).filter(Boolean),
+    region:document.querySelector('input[name=region]:checked')?.value||'us_remote',
+    easy_apply_only:$('easy_apply_only').checked,
+    job_types:[...document.querySelectorAll('.jt:checked')].map(cb=>cb.value),
+    title_include:terms($('title_include').value),
+    title_exclude:terms($('title_exclude').value),
+    fromage:parseInt($('fromage').value)||7,
+    poll_interval:parseInt($('poll_interval').value)||600,
+    use_proxy:$('use_proxy').checked,
+    headless:$('headless').checked,
+  };
+}
+
+async function saveCfg(){
+  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(collectCfgFixed())});
+}
+
+$('btn-save').addEventListener('click',async()=>{
+  await saveCfg();
+  $('btn-save').textContent='Saved!';
+  setTimeout(()=>$('btn-save').textContent='Save filters',1500);
+});
+
+$('btn-start').addEventListener('click',async()=>{await saveCfg();await fetch('/api/start',{method:'POST'})});
+$('btn-stop').addEventListener('click',()=>fetch('/api/stop',{method:'POST'}));
+
+const logEl=$('log-out');
+function addLog(level,msg){
+  const d=document.createElement('div');
+  d.className=level;d.textContent=msg;
+  logEl.appendChild(d);
+  if(logEl.children.length>600)logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop=logEl.scrollHeight;
+}
+
+function addJob(j){
+  jcount++;$('jcount').textContent=`(${jcount})`;
+  const tr=document.createElement('tr');
+  const ea=j.easy_apply?'<span class="ea">Easy</span> ':'';
+  tr.innerHTML=`<td>${ea}<a href="${j.link}" target="_blank">${j.title}</a></td>
+    <td>${j.company}</td><td>${j.location||''}</td><td>${j.salary||''}</td>`;
+  $('jobs-body').prepend(tr);
+}
+
+function setRunning(on,state){
+  $('btn-start').disabled=on;
+  $('btn-stop').disabled=!on;
+  $('dot').className='dot'+(on?' on':'');
+  if(state)$('status-text').textContent=state;
+}
+
+function connectSSE(){
+  const es=new EventSource('/api/stream');
+  es.onmessage=e=>{
+    const d=JSON.parse(e.data);
+    if(d.type==='log')addLog(d.level,d.msg);
+    else if(d.type==='job')addJob(d.job);
+    else if(d.type==='status'){setRunning(d.running,d.state);}
+  };
+  es.onerror=()=>{es.close();setTimeout(connectSSE,3000)};
+}
+
+function setTxt(id,v){const e=$(id);if(e)e.textContent=v;}
+async function pollProxies(){
+  try{
+    const s=await fetch('/api/proxystats').then(r=>r.json());
+    setTxt('px-pool',s.pool);
+    setTxt('px-safe',s.safe);
+    setTxt('px-testing',s.testing_now);
+    setTxt('px-blocked',s.blocked);
+    setTxt('px-cand',s.candidates);
+    setTxt('px-tcp',s.tcp_ok);
+    setTxt('px-tcptested',s.tcp_tested);
+    setTxt('px-cycles',s.cycles);
+    setTxt('px-probed',s.probed_total);
+    setTxt('px-served',s.served_total);
+    setTxt('px-rate', s.probed_total ? ((100*s.served_total/s.probed_total).toFixed(1)+'%') : '—');
+    $('px-served-list').textContent=(s.last_served&&s.last_served.length)?s.last_served.join('\n'):'none yet';
+    const sum = s.enabled
+      ? `proxies: ${s.pool} ready · ${s.safe} safe · ${s.testing_now} testing · ${s.blocked} blocked`
+      : 'proxies: off';
+    setTxt('px-summary', sum);
+  }catch(e){}
+}
+
+fetch('/api/jobs').then(r=>r.json()).then(js=>js.slice().reverse().forEach(addJob));
+fetch('/api/status').then(r=>r.json()).then(s=>{setRunning(s.running,s.state);});
+loadCfg();
+connectSSE();
+pollProxies();
+setInterval(pollProxies,2000);
+</script>
+</body>
+</html>"""
+
+
+def launch_web(port: int = 9876) -> None:
+    try:
+        from flask import Flask, jsonify, request as freq, Response, stream_with_context
+    except ImportError:
+        log.error("Flask not installed. Run: pip install flask")
+        sys.exit(1)
+
+    app = Flask(__name__)
+    _state: dict = {"controller": None, "status": {}}
+    _jobs: list = []
+    _clients: list = []
+    _cli_lock = threading.Lock()
+
+    class _SSELog(logging.Handler):
+        def emit(self, record):
+            msg = self.format(record)
+            data = json.dumps({"type": "log", "level": record.levelname, "msg": msg})
+            with _cli_lock:
+                for q in list(_clients):
+                    try:
+                        q.put_nowait(data)
+                    except queue.Full:
+                        pass
+
+    h = _SSELog()
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                                     datefmt="%H:%M:%S"))
+    logging.getLogger().addHandler(h)
+
+    def _broadcast(payload: dict) -> None:
+        data = json.dumps(payload)
+        with _cli_lock:
+            for q in list(_clients):
+                try:
+                    q.put_nowait(data)
+                except queue.Full:
+                    pass
+
+    @app.route("/")
+    def index():
+        return _WEB_HTML
+
+    @app.route("/api/config")
+    def get_config():
+        return jsonify(asdict(Config.load()))
+
+    @app.route("/api/config", methods=["POST"])
+    def set_config():
+        data = freq.get_json(force=True) or {}
+        cfg = Config.load()
+        for key, value in data.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, value)
+        cfg.save()
+        return jsonify({"ok": True})
+
+    @app.route("/api/start", methods=["POST"])
+    def api_start():
+        ctrl = _state.get("controller")
+        if ctrl and ctrl.is_running():
+            return jsonify({"ok": False, "error": "Already running"})
+        cfg = Config.load()
+
+        def on_job(job):
+            entry = {
+                "title": job.title, "company": job.company,
+                "location": job.location, "link": job.link,
+                "salary": job.salary, "easy_apply": job.easy_apply,
+            }
+            _jobs.insert(0, entry)
+            del _jobs[200:]
+            _broadcast({"type": "job", "job": entry})
+
+        def on_status(status):
+            _state["status"] = status
+            ctrl = _state.get("controller")
+            _broadcast({"type": "status", "running": bool(ctrl and ctrl.is_running()), **status})
+
+        new_ctrl = Controller(cfg, on_job=on_job, on_status=on_status)
+        new_ctrl.start()
+        _state["controller"] = new_ctrl
+        return jsonify({"ok": True})
+
+    @app.route("/api/stop", methods=["POST"])
+    def api_stop():
+        ctrl = _state.get("controller")
+        if ctrl:
+            threading.Thread(target=ctrl.stop, kwargs={"timeout": 10}, daemon=True).start()
+        return jsonify({"ok": True})
+
+    @app.route("/api/status")
+    def api_status():
+        ctrl = _state.get("controller")
+        return jsonify({
+            "running": bool(ctrl and ctrl.is_running()),
+            **_state.get("status", {}),
+        })
+
+    @app.route("/api/jobs")
+    def api_jobs():
+        return jsonify(_jobs)
+
+    @app.route("/api/proxystats")
+    def api_proxystats():
+        ctrl = _state.get("controller")
+        if ctrl and getattr(ctrl, "proxy_manager", None):
+            return jsonify(ctrl.proxy_manager.stats())
+        return jsonify({"enabled": False, "pool": 0, "safe": 0, "blocked": 0,
+                        "candidates": 0, "tcp_tested": 0, "tcp_ok": 0,
+                        "probed_total": 0, "served_total": 0, "testing_now": 0,
+                        "cycles": 0, "last_served": []})
+
+    @app.route("/api/stream")
+    def api_stream():
+        q: queue.Queue = queue.Queue(maxsize=500)
+        ctrl = _state.get("controller")
+        try:
+            q.put_nowait(json.dumps({
+                "type": "status",
+                "running": bool(ctrl and ctrl.is_running()),
+                **_state.get("status", {}),
+            }))
+        except queue.Full:
+            pass
+        with _cli_lock:
+            _clients.append(q)
+
+        def generate():
+            try:
+                while True:
+                    try:
+                        yield f"data: {q.get(timeout=25)}\n\n"
+                    except queue.Empty:
+                        yield 'data: {"type":"ping"}\n\n'
+            finally:
+                with _cli_lock:
+                    try:
+                        _clients.remove(q)
+                    except ValueError:
+                        pass
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    import logging as _logging
+    _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
+    log.info("Web UI → http://localhost:%d", port)
+    from werkzeug.serving import run_simple
+    run_simple("0.0.0.0", port, app, threaded=True, use_reloader=False)
+
+
+# ── Surfshark wireproxy manager ───────────────────────────────────────────────
+
+class WireproxyManager:
+    """Starts local wireproxy tunnels from vpn/*.conf and hands out SOCKS5 URLs.
+
+    Each .conf file becomes one process exposing a SOCKS5 port as declared in
+    its [Socks5] BindAddress line.  Processes are launched lazily on first
+    call to start() and killed on stop().  Only configs whose tunnels actually
+    handshake within the warmup period are promoted to the ready pool.
+    """
+
+    def __init__(self, conf_dir: Path = WIREPROXY_CONF_DIR,
+                 binary: Path = WIREPROXY_BIN):
+        self.conf_dir = conf_dir
+        self.binary = binary
+        self._procs: list[tuple[subprocess.Popen, str, int]] = []  # (proc, name, port)
+        self._ready: list[str] = []   # socks5://127.0.0.1:<port>
+        self._lock = threading.Lock()
+
+    def available(self) -> bool:
+        return self.binary.exists() and self.conf_dir.exists()
+
+    def start(self, warmup: float = 8.0) -> list[str]:
+        if not self.available():
+            return []
+        confs = sorted(self.conf_dir.glob("*.conf"))
+        if not confs:
+            return []
+
+        launched = []
+        for conf in confs:
+            port = self._extract_port(conf)
+            if not port:
+                continue
+            try:
+                proc = subprocess.Popen(
+                    [str(self.binary), "-c", str(conf)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._procs.append((proc, conf.stem, port))
+                launched.append((conf.stem, port))
+                log.debug("wireproxy: launched %s on port %d (pid %d)", conf.stem, port, proc.pid)
+            except Exception as exc:
+                log.warning("wireproxy: could not start %s: %s", conf.stem, exc)
+
+        if not launched:
+            return []
+
+        # Wait for tunnels to come up, then validate each with a TCP connect
+        log.info("wireproxy: waiting %.0fs for %d tunnel(s) to connect…", warmup, len(launched))
+        time.sleep(warmup)
+
+        ready = []
+        for name, port in launched:
+            try:
+                sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+                sock.close()
+                url = f"socks5://127.0.0.1:{port}"
+                ready.append(url)
+                log.info("wireproxy: ✅ %s ready on port %d", name, port)
+            except Exception:
+                log.warning("wireproxy: ❌ %s not responding on port %d", name, port)
+
+        with self._lock:
+            self._ready = ready
+        if ready:
+            log.info("wireproxy: %d/%d tunnel(s) ready — using Surfshark VPN proxies.", len(ready), len(launched))
+        else:
+            log.warning("wireproxy: no tunnels came up (WireGuard handshake may have failed — check your Surfshark configs).")
+        return ready
+
+    def stop(self) -> None:
+        for proc, name, port in self._procs:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._procs.clear()
+        with self._lock:
+            self._ready.clear()
+
+    def proxies(self) -> list[str]:
+        with self._lock:
+            return list(self._ready)
+
+    @staticmethod
+    def _extract_port(conf: Path) -> int | None:
+        try:
+            for line in conf.read_text().splitlines():
+                if line.strip().startswith("BindAddress"):
+                    _, _, addr = line.partition("=")
+                    port_str = addr.strip().rsplit(":", 1)[-1]
+                    return int(port_str)
+        except Exception:
+            pass
+        return None
+
+
+# ── Login session capture ─────────────────────────────────────────────────────
+
+def login_indeed() -> None:
+    """Open a visible browser so the user can log into Indeed, then save the
+    session to indeed_session.json for headless scraping.
+
+    Indeed's Cloudflare Turnstile requires human interaction — once the user
+    logs in, the resulting cookies bypass the challenge in all future runs.
+    """
+    print("\n  Opening a browser window — please log into Indeed, then close the window.\n")
+    print("  Session will be saved to:", SESSION_FILE)
+    print("  (You only need to do this once; the session persists across restarts.)\n")
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("playwright not installed — run: pip install playwright && playwright install chromium")
+        sys.exit(1)
+
+    with sync_playwright() as pw:
+        # Use installed Chrome so it has the real fingerprint
+        launch_opts: dict = {
+            "headless": False,
+            "args": ["--no-sandbox"],
+        }
+        try:
+            test = pw.chromium.launch(channel="chrome", headless=True)
+            test.close()
+            launch_opts["channel"] = "chrome"
+        except Exception:
+            pass
+
+        browser = pw.chromium.launch(**launch_opts)
+        ctx = browser.new_context(
+            user_agent=UA,
+            viewport={"width": 1440, "height": 900},
+            locale="en-US",
+        )
+        page = ctx.new_page()
+        page.goto("https://secure.indeed.com/account/login", wait_until="domcontentloaded", timeout=30000)
+
+        print("  Waiting for you to log in and for Indeed's home page to appear…")
+        try:
+            page.wait_for_url("**/jobs**", timeout=180000)
+        except Exception:
+            pass
+
+        # Also wait for the session cookie to arrive
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            cookies = ctx.cookies()
+            if any(c["name"] in ("CTK", "INDEED_CSRF_TOKEN", "LG", "JSESSIONID") for c in cookies):
+                break
+            time.sleep(1)
+
+        ctx.storage_state(path=str(SESSION_FILE))
+        browser.close()
+
+    print(f"\n  ✅ Session saved to {SESSION_FILE}")
+    print("     Run 'python indeed_notifier.py --web' (or --nogui) to start watching.\n")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1963,15 +2870,23 @@ def check_ip() -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Watch Indeed searches — UI, 5 workers, shared rotating proxy.")
     ap.add_argument("--nogui", action="store_true", help="run the watch loop without the UI")
+    ap.add_argument("--web", action="store_true", help="launch web UI (default port 9876)")
+    ap.add_argument("--port", type=int, default=9876, help="port for --web mode (default 9876)")
     ap.add_argument("--once", action="store_true", help="one cycle, then exit (implies --nogui)")
     ap.add_argument("--reseed", action="store_true", help="discard state and re-seed silently")
     ap.add_argument("--no-proxy", action="store_true", help="disable proxy rotation")
     ap.add_argument("--checkip", action="store_true", help="show the current egress IP and test Indeed")
+    ap.add_argument("--login", action="store_true",
+                    help="open a visible browser to log into Indeed and save session cookies")
     args = ap.parse_args()
 
-    if args.checkip:
+    if args.login:
+        login_indeed()
+    elif args.checkip:
         check_ip()
     elif args.nogui or args.once:
         run_headless(once=args.once, reseed=args.reseed, no_proxy=args.no_proxy)
+    elif args.web:
+        launch_web(port=args.port)
     else:
-        launch_ui()
+        launch_web(port=args.port)
